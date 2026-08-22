@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 当前会话导出 Markdown
 // @namespace    https://chatgpt.com/
-// @version      2.12.0
+// @version      2.13.0
 // @description  从原始会话数据导出 Markdown，保留代码、Mermaid、公式、图片和附件。
 // @match        https://chatgpt.com/*
 // @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
@@ -17,10 +17,8 @@
   const BUTTON_ID = "codex-markdown-export-button";
   const MESSAGE_SELECTOR = "[data-message-author-role][data-message-id]";
   const EXPORT_ATTACHMENTS_KEY = "export-attachments";
-  const SCRIPT_VERSION = "2.12.0";
+  const SCRIPT_VERSION = "2.13.0";
   let exportSettingsCommandId;
-
-  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
   function includeAttachmentsEnabled() {
     return GM_getValue(EXPORT_ATTACHMENTS_KEY, true);
@@ -548,16 +546,14 @@
   function messagesFromConversation(conversation, renderedMessages = null) {
     const messages = [];
     const path = mainPath(conversation);
-    const lastNodeForRenderedId = new Map();
+    const lastNodeForMessageId = new Map();
 
-    if (renderedMessages?.size) {
-      for (const node of path) {
-        const message = node.message;
-        const role = message?.author?.role;
-        const id = message?.id || node.id;
-        if (["user", "assistant"].includes(role) && renderedMessages.has(id) && exportedMessageRole(message, node.id, renderedMessages)) {
-          lastNodeForRenderedId.set(id, node);
-        }
+    for (const node of path) {
+      const message = node.message;
+      const role = message?.author?.role;
+      const id = message?.id || node.id;
+      if (["user", "assistant"].includes(role) && exportedMessageRole(message, node.id, renderedMessages)) {
+        lastNodeForMessageId.set(id, node);
       }
     }
 
@@ -567,7 +563,7 @@
       const id = message?.id || node.id;
       const exportRole = exportedMessageRole(message, node.id, renderedMessages);
       if (!exportRole) continue;
-      if (lastNodeForRenderedId.size && ["user", "assistant"].includes(role) && lastNodeForRenderedId.get(id) !== node) continue;
+      if (["user", "assistant"].includes(role) && lastNodeForMessageId.get(id) !== node) continue;
 
       const renderedText = role === "user" && renderedMessages?.size
         ? renderedMessages.get(id)?.content || ""
@@ -779,16 +775,6 @@
     return closers.length ? `${text}\n\n${closers.join("\n")}` : text;
   }
 
-  function findScroller(message) {
-    for (let element = message; element; element = element.parentElement) {
-      const style = getComputedStyle(element);
-      if (/auto|scroll/.test(style.overflowY) && element.scrollHeight > element.clientHeight + 20) {
-        return element;
-      }
-    }
-    return document.scrollingElement || document.documentElement;
-  }
-
   function isRenderedMessageElement(element) {
     if (element.closest('[hidden], [aria-hidden="true"], [inert]') || !element.getClientRects().length) return false;
 
@@ -819,44 +805,10 @@
     }
   }
 
-  async function collectMessagesFromDom() {
-    const firstMessage = document.querySelector(MESSAGE_SELECTOR);
-    if (!firstMessage) throw new Error("当前页面没有找到可导出的 ChatGPT 会话");
-
-    const scroller = findScroller(firstMessage);
-    const originalTop = scroller.scrollTop;
-    const originalBehavior = scroller.style.scrollBehavior;
+  function collectMessagesFromDom() {
     const messages = new Map();
-
-    scroller.style.scrollBehavior = "auto";
-
-    try {
-      scroller.scrollTop = 0;
-      await wait(250);
-
-      let unchanged = 0;
-      let previousTop = -1;
-
-      for (let index = 0; index < 500; index += 1) {
-        readVisibleMessages(messages);
-
-        const bottom = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-        if (scroller.scrollTop >= bottom - 2) break;
-
-        const nextTop = Math.min(bottom, scroller.scrollTop + Math.max(400, scroller.clientHeight * 0.75));
-        scroller.scrollTop = nextTop;
-        await wait(120);
-
-        unchanged = Math.abs(scroller.scrollTop - previousTop) < 1 ? unchanged + 1 : 0;
-        previousTop = scroller.scrollTop;
-        if (unchanged >= 5) break;
-      }
-
-      readVisibleMessages(messages);
-    } finally {
-      scroller.scrollTop = originalTop;
-      scroller.style.scrollBehavior = originalBehavior;
-    }
+    readVisibleMessages(messages);
+    if (!messages.size) throw new Error("当前页面没有找到可导出的 ChatGPT 会话");
 
     return Array.from(messages.values()).sort((a, b) => a.turn - b.turn);
   }
@@ -864,7 +816,6 @@
   async function collectConversation(includeAttachments = false) {
     const errors = [];
     let conversation = null;
-    let domMessages = null;
     let headers = null;
     let sourceMode = "";
 
@@ -891,25 +842,15 @@
     }
 
     if (conversation) {
-      try {
-        domMessages = await collectMessagesFromDom();
-      } catch {
-        // Metadata remains a safe fallback when the page has not rendered yet.
-      }
-
-      const renderedMessages = domMessages?.length
-        ? new Map(domMessages.map(message => [message.id, message]))
-        : null;
-      const assets = await hydrateConversationAssets(conversation, renderedMessages, headers, includeAttachments);
-      const messages = messagesFromConversation(conversation, renderedMessages);
+      const assets = await hydrateConversationAssets(conversation, null, headers, includeAttachments);
+      const messages = messagesFromConversation(conversation);
       if (messages.length) {
         const warnings = [];
         if (assets.failed) warnings.push(`${assets.failed} 个附件或图片未能保存，Markdown 已保留在线链接或资源标识。`);
-        if (!renderedMessages) warnings.push("未能读取页面可见消息列表，已按消息频道和隐藏标记过滤内部消息。");
         return {
           messages,
           title: conversation.title || "",
-          sourceMode: renderedMessages ? `${sourceMode} + 页面可见消息校验` : sourceMode,
+          sourceMode,
           warning: warnings.join(" "),
           downloads: assets.downloads,
         };
@@ -917,7 +858,7 @@
       errors.push("原始会话中没有可见的用户或 ChatGPT 消息");
     }
 
-    const messages = domMessages || await collectMessagesFromDom();
+    const messages = collectMessagesFromDom();
     return {
       messages,
       title: "",
@@ -1007,7 +948,8 @@
     for (const attachment of attachments) {
       directory.file(attachment.name, attachment.blob);
     }
-    const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+    // ponytail: 图片、PDF 等附件通常已压缩，STORE 优先速度；需要更小体积时再启用 DEFLATE。
+    const blob = await zip.generateAsync({ type: "blob" });
     const archiveName = `${baseName}.zip`;
     downloadBlob(blob, archiveName);
     return archiveName;
@@ -1298,6 +1240,7 @@
     assert(!raw.some(message => message.content.includes("INCOMPLETE_ASSISTANT_ONLY")), "未完成的 Assistant 消息");
     assert(!raw.some(message => message.content.includes("FILE_SEARCH_ASSISTANT_ONLY")), "Assistant 角色的文件检索消息");
     assert(!raw.some(message => message.content.includes("MASQUERADE_INTERNAL_ONLY")), "与可见回复共用消息 ID 的内部节点");
+    assert(!metadataOnly.some(message => message.content.includes("MASQUERADE_INTERNAL_ONLY")), "原始接口消息 ID 去重");
     assert(!raw.some(message => message.content.includes("TOOL_FILE_CONTEXT_ONLY") || message.content.includes("file_pdf_page")), "带页面图片的文件检索上下文");
     assert(!metadataOnly.some(message => message.id === "assistant-analysis"), "无 DOM 时按频道过滤");
     assert(attachmentIdentity({ asset_pointer: "sediment://file_test" }) === attachmentIdentity({ file_id: "file_test" }), "附件 ID 归一化");
