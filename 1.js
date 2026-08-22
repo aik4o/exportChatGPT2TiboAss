@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         ChatGPT 当前会话导出 Markdown
 // @namespace    https://chatgpt.com/
-// @version      2.9.1
+// @version      2.10.0
 // @description  从原始会话数据导出 Markdown，保留代码、Mermaid、公式、图片和附件。
 // @match        https://chatgpt.com/*
-// @grant        none
+// @grant        GM_download
+// @grant        GM_info
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -14,7 +15,7 @@
   const BUTTON_ID = "codex-markdown-export-button";
   const ATTACHMENTS_BUTTON_ID = "codex-markdown-export-with-attachments-button";
   const MESSAGE_SELECTOR = "[data-message-author-role][data-message-id]";
-  const SCRIPT_VERSION = "2.9.1";
+  const SCRIPT_VERSION = "2.10.0";
 
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -968,22 +969,28 @@
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  async function writeExportFile(directory, name, data) {
-    const handle = await directory.getFileHandle(name, { create: true });
-    const writable = await handle.createWritable();
-    await writable.write(data);
-    await writable.close();
+  function downloadToDefaultFolder(data, name) {
+    if (typeof GM_download !== "function") throw new Error("Tampermonkey 未提供下载权限，请重新保存脚本并授权下载");
+    const mode = typeof GM_info === "object" ? GM_info.downloadMode : "";
+    if (mode && mode !== "browser") throw new Error("请在 Tampermonkey 设置中将下载模式设为“浏览器 API”并授予下载权限");
+
+    return new Promise((resolve, reject) => GM_download({
+      url: data,
+      name,
+      saveAs: false,
+      conflictAction: "uniquify",
+      onload: resolve,
+      onerror: error => reject(new Error(`下载失败：${error?.details || error?.error || "未知错误"}`)),
+    }));
   }
 
-  async function saveExportFolder(parentDirectory, markdown, title, attachments) {
+  async function saveExportFolder(markdown, title, attachments) {
     const baseName = safeFilename(conversationTitle(title)).replace(/\.md$/i, "");
-    const timestamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
-    const folderName = `${baseName} - ${timestamp}`;
-    const directory = await parentDirectory.getDirectoryHandle(folderName, { create: true });
+    const folderName = baseName;
 
-    await writeExportFile(directory, `${baseName}.md`, markdown);
+    await downloadToDefaultFolder(new Blob([markdown], { type: "text/markdown;charset=utf-8" }), `${folderName}/${baseName}.md`);
     for (const attachment of attachments) {
-      await writeExportFile(directory, attachment.name, attachment.blob);
+      await downloadToDefaultFolder(attachment.blob, `${folderName}/${attachment.name}`);
     }
     return folderName;
   }
@@ -1000,13 +1007,6 @@
     button.setAttribute("aria-disabled", "true");
 
     try {
-      let parentDirectory = null;
-      if (includeAttachments) {
-        if (typeof window.showDirectoryPicker !== "function") throw new Error("当前浏览器不支持文件夹导出");
-        showStatus(button, "请选择保存位置…");
-        parentDirectory = await window.showDirectoryPicker({ mode: "readwrite" });
-      }
-
       showStatus(button, "正在收集…");
       const result = await collectConversation(includeAttachments);
       const { messages } = result;
@@ -1014,8 +1014,9 @@
       const markdown = buildMarkdown(messages, result.title, result.sourceMode, result.warning);
 
       if (includeAttachments) {
-        const folderName = await saveExportFolder(parentDirectory, markdown, result.title, result.downloads || []);
-        showStatus(button, `已保存文件夹：${folderName}`);
+        showStatus(button, "正在下载到默认下载目录…");
+        const folderName = await saveExportFolder(markdown, result.title, result.downloads || []);
+        showStatus(button, `已下载到：${folderName}`);
       } else {
         downloadMarkdown(markdown, result.title);
         showStatus(button, `已导出 ${messages.length} 条消息`);
@@ -1265,6 +1266,7 @@
 
     assert(inlineCode("a`b") === "``a`b``", "行内代码");
     assert(safeFilename('a:b?c') === "a_b_c.md", "文件名");
+    assert(safeFilename("测试会话").replace(/\.md$/i, "") === "测试会话", "默认下载子目录名称");
     assert(normalizeMarkdown("a\n\n\nb") === "a\n\nb", "空行");
     assert(escapeHtmlText("vector<int>") === "vector&lt;int&gt;", "用户文本中的 HTML 尖括号");
     assert(escapeHtmlOutsideCode("vector<int>\n`vector<int>`\n```cpp\n#include <vector>\n```") === "vector&lt;int&gt;\n`vector<int>`\n```cpp\n#include <vector>\n```", "代码内尖括号保持原样");
