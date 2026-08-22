@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 当前会话导出 Markdown
 // @namespace    https://chatgpt.com/
-// @version      2.13.0
+// @version      2.14.0
 // @description  从原始会话数据导出 Markdown，保留代码、Mermaid、公式、图片和附件。
 // @match        https://chatgpt.com/*
 // @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
@@ -17,8 +17,10 @@
   const BUTTON_ID = "codex-markdown-export-button";
   const MESSAGE_SELECTOR = "[data-message-author-role][data-message-id]";
   const EXPORT_ATTACHMENTS_KEY = "export-attachments";
-  const SCRIPT_VERSION = "2.13.0";
+  const SCRIPT_VERSION = "2.14.0";
   let exportSettingsCommandId;
+  let apiHeadersPromise;
+  let conversationCache;
 
   function includeAttachmentsEnabled() {
     return GM_getValue(EXPORT_ATTACHMENTS_KEY, true);
@@ -99,7 +101,7 @@
     return location.pathname.match(/\/c\/([0-9a-f-]{16,})/i)?.[1] || "";
   }
 
-  async function apiHeaders() {
+  async function loadApiHeaders() {
     const headers = { Accept: "application/json" };
     const sessionResponse = await fetch("/api/auth/session", {
       credentials: "include",
@@ -135,20 +137,50 @@
     return headers;
   }
 
-  async function fetchedConversation(headers) {
+  function apiHeaders() {
+    if (!apiHeadersPromise) {
+      apiHeadersPromise = loadApiHeaders().catch(error => {
+        apiHeadersPromise = null;
+        throw error;
+      });
+    }
+    return apiHeadersPromise;
+  }
+
+  function pageConversationRevision() {
+    const messages = document.querySelectorAll(MESSAGE_SELECTOR);
+    const last = messages[messages.length - 1];
+    if (!last) return "";
+    // ponytail: 廉价失效信号；只有同 ID、同长度的实时改写出现时才值得换完整内容哈希。
+    return `${last.dataset.messageId || ""}:${last.textContent?.length || 0}:${last.querySelectorAll("img").length}`;
+  }
+
+  function isFreshConversationCache(cache, id, revision = pageConversationRevision()) {
+    return cache?.id === id && cache.revision === revision;
+  }
+
+  function fetchedConversation(headers) {
     const id = conversationId();
-    if (!id) return null;
+    if (!id) return Promise.resolve(null);
+    const revision = pageConversationRevision();
+    if (isFreshConversationCache(conversationCache, id, revision)) return conversationCache.promise;
 
-    const response = await fetch(`/backend-api/conversation/${id}`, {
-      credentials: "include",
-      cache: "no-store",
-      headers,
-    });
+    const promise = (async () => {
+      const response = await fetch(`/backend-api/conversation/${id}`, {
+        credentials: "include",
+        cache: "no-store",
+        headers,
+      });
 
-    if (!response.ok) throw new Error(`读取原始会话失败（HTTP ${response.status}）`);
-    const data = await response.json();
-    if (!data?.mapping || !data?.current_node) throw new Error("原始会话数据结构不完整");
-    return data;
+      if (!response.ok) throw new Error(`读取原始会话失败（HTTP ${response.status}）`);
+      const data = await response.json();
+      if (!data?.mapping || !data?.current_node) throw new Error("原始会话数据结构不完整");
+      return data;
+    })();
+
+    conversationCache = { id, revision, promise };
+    promise.catch(() => { if (conversationCache?.promise === promise) conversationCache = null; });
+    return promise;
   }
 
   function fileDownloadUrl(pointer) {
@@ -1056,6 +1088,7 @@
       if (!exportButton) continue;
 
       deleteItem.after(exportButton);
+      if (!location.pathname.includes("/share/")) void apiHeaders().then(fetchedConversation).catch(() => {});
       return;
     }
   }
@@ -1224,6 +1257,7 @@
     assert(safeFilename('a:b?c') === "a_b_c.md", "文件名");
     assert(`${safeFilename("测试会话").replace(/\.md$/i, "")}.zip` === "测试会话.zip", "压缩包名称");
     assert(exportSettingsLabel(true).includes("开启") && exportSettingsLabel(false).includes("关闭"), "附件导出设置标签");
+    assert(isFreshConversationCache({ id: "chat", revision: "v1" }, "chat", "v1") && !isFreshConversationCache({ id: "chat", revision: "v1" }, "chat", "v2"), "会话预取缓存失效");
     assert(normalizeMarkdown("a\n\n\nb") === "a\n\nb", "空行");
     assert(escapeHtmlText("vector<int>") === "vector&lt;int&gt;", "用户文本中的 HTML 尖括号");
     assert(escapeHtmlOutsideCode("vector<int>\n`vector<int>`\n```cpp\n#include <vector>\n```") === "vector&lt;int&gt;\n`vector<int>`\n```cpp\n#include <vector>\n```", "代码内尖括号保持原样");
@@ -1261,6 +1295,7 @@
 
   selfCheck();
   registerExportSettings();
+  if (!location.pathname.includes("/share/")) void apiHeaders().then(fetchedConversation).catch(() => {});
   if (document.body) observeMenuButton();
   else window.addEventListener("DOMContentLoaded", observeMenuButton, { once: true });
 })();
