@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         ChatGPT 当前会话导出 Markdown
 // @namespace    https://chatgpt.com/
-// @version      2.11.0
+// @version      2.12.0
 // @description  从原始会话数据导出 Markdown，保留代码、Mermaid、公式、图片和附件。
 // @match        https://chatgpt.com/*
 // @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
-// @grant        none
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -13,11 +15,31 @@
   "use strict";
 
   const BUTTON_ID = "codex-markdown-export-button";
-  const ATTACHMENTS_BUTTON_ID = "codex-markdown-export-with-attachments-button";
   const MESSAGE_SELECTOR = "[data-message-author-role][data-message-id]";
-  const SCRIPT_VERSION = "2.11.0";
+  const EXPORT_ATTACHMENTS_KEY = "export-attachments";
+  const SCRIPT_VERSION = "2.12.0";
+  let exportSettingsCommandId;
 
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  function includeAttachmentsEnabled() {
+    return GM_getValue(EXPORT_ATTACHMENTS_KEY, true);
+  }
+
+  function exportSettingsLabel(enabled) {
+    return `导出设置：附件（${enabled ? "开启" : "关闭"}）`;
+  }
+
+  function registerExportSettings() {
+    const enabled = includeAttachmentsEnabled();
+    exportSettingsCommandId = GM_registerMenuCommand(exportSettingsLabel(enabled), () => {
+      GM_setValue(EXPORT_ATTACHMENTS_KEY, !enabled);
+      registerExportSettings();
+    }, {
+      id: exportSettingsCommandId,
+      title: "点击切换导出时是否包含附件",
+    });
+  }
 
   function reviveFlatData(flat) {
     const seen = new Map();
@@ -1037,7 +1059,7 @@
     return /^(?:删除(?:聊天)?|Delete(?: chat)?)(?:\s|$)/i.test((item.textContent || "").replace(/\s+/g, " ").trim());
   }
 
-  function createExportMenuItem(template, id, label, includeAttachments) {
+  function createExportMenuItem(template, id, label) {
     const button = template.cloneNode(true);
     const walker = document.createTreeWalker(button, NodeFilter.SHOW_TEXT);
     let labelNode = walker.nextNode();
@@ -1060,15 +1082,13 @@
       icon.setAttribute("stroke-width", "2");
       icon.setAttribute("stroke-linecap", "round");
       icon.setAttribute("stroke-linejoin", "round");
-      icon.innerHTML = includeAttachments
-        ? '<path d="M3 7h5l2 2h11v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M12 11v6"/><path d="m9 14 3 3 3-3"/>'
-        : '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>';
+      icon.innerHTML = '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>';
     }
 
     button.addEventListener("click", event => {
       event.preventDefault();
       event.stopPropagation();
-      if (button.getAttribute("aria-disabled") !== "true") exportCurrentConversation(button, includeAttachments);
+      if (button.getAttribute("aria-disabled") !== "true") exportCurrentConversation(button, includeAttachmentsEnabled());
     });
     if (button.tagName !== "BUTTON") {
       button.addEventListener("keydown", event => {
@@ -1079,7 +1099,7 @@
   }
 
   function addButton() {
-    if (document.getElementById(BUTTON_ID) && document.getElementById(ATTACHMENTS_BUTTON_ID)) return;
+    if (document.getElementById(BUTTON_ID)) return;
 
     for (const menu of document.querySelectorAll('[role="menu"]')) {
       if (!isRenderedMessageElement(menu)) continue;
@@ -1090,12 +1110,10 @@
       const template = items[Math.max(0, items.indexOf(deleteItem) - 1)];
       if (!template || template === deleteItem) continue;
 
-      const markdownButton = createExportMenuItem(template, BUTTON_ID, "仅导出 Markdown", false);
-      const attachmentsButton = createExportMenuItem(template, ATTACHMENTS_BUTTON_ID, "导出 Markdown + 附件", true);
-      if (!markdownButton || !attachmentsButton) continue;
+      const exportButton = createExportMenuItem(template, BUTTON_ID, "导出");
+      if (!exportButton) continue;
 
-      deleteItem.after(markdownButton);
-      markdownButton.after(attachmentsButton);
+      deleteItem.after(exportButton);
       return;
     }
   }
@@ -1263,6 +1281,7 @@
     assert(inlineCode("a`b") === "``a`b``", "行内代码");
     assert(safeFilename('a:b?c') === "a_b_c.md", "文件名");
     assert(`${safeFilename("测试会话").replace(/\.md$/i, "")}.zip` === "测试会话.zip", "压缩包名称");
+    assert(exportSettingsLabel(true).includes("开启") && exportSettingsLabel(false).includes("关闭"), "附件导出设置标签");
     assert(normalizeMarkdown("a\n\n\nb") === "a\n\nb", "空行");
     assert(escapeHtmlText("vector<int>") === "vector&lt;int&gt;", "用户文本中的 HTML 尖括号");
     assert(escapeHtmlOutsideCode("vector<int>\n`vector<int>`\n```cpp\n#include <vector>\n```") === "vector&lt;int&gt;\n`vector<int>`\n```cpp\n#include <vector>\n```", "代码内尖括号保持原样");
@@ -1298,6 +1317,7 @@
   }
 
   selfCheck();
+  registerExportSettings();
   if (document.body) observeMenuButton();
   else window.addEventListener("DOMContentLoaded", observeMenuButton, { once: true });
 })();
