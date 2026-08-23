@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 当前会话导出 Markdown
 // @namespace    https://chatgpt.com/
-// @version      3.2.2
+// @version      3.2.3
 // @description  从原始会话数据导出 Markdown，保留代码、Mermaid、公式、图片和附件。
 // @match        https://chatgpt.com/*
 // @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
@@ -20,7 +20,7 @@
   const PROJECT_EXPORT_BUTTON_ID = "codex-project-export-button";
   const MESSAGE_SELECTOR = "[data-message-author-role][data-message-id]";
   const EXPORT_ATTACHMENTS_KEY = "export-attachments";
-  const SCRIPT_VERSION = "3.2.2";
+  const SCRIPT_VERSION = "3.2.3";
   let exportSettingsCommandId;
   let apiHeadersPromise;
   let conversationCache;
@@ -1599,6 +1599,7 @@
     const chevron = menu.querySelector('[data-testid="menu-item-submenu-chevron"]')?.cloneNode(true);
     if (chevron) {
       chevron.removeAttribute("data-testid");
+      chevron.style.marginInlineStart = "auto";
       exportButton.appendChild(chevron);
     }
     exportButton.setAttribute("aria-haspopup", "menu");
