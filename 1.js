@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 当前会话导出 Markdown
 // @namespace    https://chatgpt.com/
-// @version      3.0.0
+// @version      3.1.0
 // @description  从原始会话数据导出 Markdown，保留代码、Mermaid、公式、图片和附件。
 // @match        https://chatgpt.com/*
 // @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
@@ -16,9 +16,11 @@
 
   const BUTTON_ID = "codex-markdown-export-button";
   const BATCH_DIALOG_ID = "codex-batch-export-dialog";
+  const BATCH_SUBMENU_ID = "codex-batch-export-submenu";
+  const PROJECT_EXPORT_BUTTON_ID = "codex-project-export-button";
   const MESSAGE_SELECTOR = "[data-message-author-role][data-message-id]";
   const EXPORT_ATTACHMENTS_KEY = "export-attachments";
-  const SCRIPT_VERSION = "3.0.0";
+  const SCRIPT_VERSION = "3.1.0";
   let exportSettingsCommandId;
   let apiHeadersPromise;
   let conversationCache;
@@ -1081,13 +1083,16 @@
     return results;
   }
 
-  async function loadBatchGroups() {
+  async function loadBatchGroups(projectName = "") {
     const headers = await apiHeaders();
     const [regularItems, projects] = await Promise.all([
-      fetchConversationIndex(headers),
+      projectName ? Promise.resolve([]) : fetchConversationIndex(headers),
       fetchProjects(headers),
     ]);
-    const projectGroups = await mapConcurrent(projects, 4, async project => {
+    // ponytail: 项目菜单只暴露名称；若 ChatGPT 允许重名项目，再按侧栏顺序补充 ID 匹配。
+    const selectedProjects = projectName ? projects.filter(project => project.name === projectName).slice(0, 1) : projects;
+    if (projectName && !selectedProjects.length) throw new Error(`未找到项目：${projectName}`);
+    const projectGroups = await mapConcurrent(selectedProjects, 4, async project => {
       try {
         return { id: project.id, name: project.name, items: await fetchProjectConversations(project.id, headers) };
       } catch (error) {
@@ -1103,7 +1108,7 @@
     const ungrouped = regularItems
       .filter(item => !claimed.has(item.id))
       .map(item => ({ ...item, groupName: "其他对话" }));
-    if (ungrouped.length) groups.push({ id: "", name: "其他对话", items: ungrouped });
+    if (!projectName && ungrouped.length) groups.push({ id: "", name: "其他对话", items: ungrouped });
     return { headers, groups };
   }
 
@@ -1167,7 +1172,7 @@
     const style = document.createElement("style");
     style.id = `${BATCH_DIALOG_ID}-style`;
     style.textContent = `
-      #${BATCH_DIALOG_ID} { color-scheme: light dark; width: min(760px, calc(100vw - 32px)); max-height: min(760px, calc(100vh - 32px)); padding: 0; color: var(--text-primary, #0d0d0d); background: var(--main-surface-primary, #fff); border: 1px solid var(--border-medium, rgba(0,0,0,.15)); border-radius: 18px; box-shadow: 0 24px 80px rgba(0,0,0,.28); }
+      #${BATCH_DIALOG_ID} { color-scheme: light dark; position: fixed; inset: 0; width: min(760px, calc(100vw - 32px)); height: fit-content; max-height: min(760px, calc(100vh - 32px)); margin: auto; padding: 0; color: var(--text-primary, #0d0d0d); background: var(--main-surface-primary, #fff); border: 1px solid var(--border-medium, rgba(0,0,0,.15)); border-radius: 18px; box-shadow: 0 24px 80px rgba(0,0,0,.28); }
       #${BATCH_DIALOG_ID}::backdrop { background: rgba(0,0,0,.5); backdrop-filter: blur(2px); }
       #${BATCH_DIALOG_ID} .codex-batch-layout { display: flex; flex-direction: column; max-height: min(760px, calc(100vh - 32px)); }
       #${BATCH_DIALOG_ID} .codex-batch-header, #${BATCH_DIALOG_ID} .codex-batch-toolbar, #${BATCH_DIALOG_ID} .codex-batch-footer { display: flex; align-items: center; gap: 12px; padding: 14px 18px; }
@@ -1194,7 +1199,8 @@
     document.head.appendChild(style);
   }
 
-  function openBatchExportDialog() {
+  function openBatchExportDialog(projectName = "") {
+    if (typeof projectName !== "string") projectName = "";
     const existing = document.getElementById(BATCH_DIALOG_ID);
     if (existing) {
       if (!existing.open) existing.showModal();
@@ -1206,7 +1212,7 @@
     dialog.id = BATCH_DIALOG_ID;
     dialog.innerHTML = `
       <div class="codex-batch-layout">
-        <div class="codex-batch-header"><h2>批量导出</h2><button type="button" data-close aria-label="关闭">✕</button></div>
+        <div class="codex-batch-header"><h2>${projectName ? `导出项目：${escapeHtml(projectName)}` : "批量导出"}</h2><button type="button" data-close aria-label="关闭">✕</button></div>
         <div class="codex-batch-toolbar">
           <input type="search" data-search placeholder="搜索对话或项目" aria-label="搜索对话或项目">
           <label><input type="checkbox" data-select-all> 全选当前结果</label>
@@ -1290,7 +1296,7 @@
     });
 
     dialog.showModal();
-    void loadBatchGroups().then(({ groups }) => {
+    void loadBatchGroups(projectName).then(({ groups }) => {
       if (!dialog.isConnected) return;
       list.replaceChildren();
       const fragment = document.createDocumentFragment();
@@ -1298,6 +1304,7 @@
         const section = document.createElement("section");
         section.className = "codex-batch-group";
         section.dataset.title = group.name.toLocaleLowerCase();
+        section.codexGroup = group;
         const heading = document.createElement("label");
         heading.className = "codex-batch-group-title";
         const groupCheckbox = document.createElement("input");
@@ -1333,6 +1340,16 @@
       }
       list.appendChild(fragment);
       updateSelection();
+      if (projectName) {
+        const section = Array.from(dialog.querySelectorAll(".codex-batch-group"))
+          .find(candidate => candidate.codexGroup.name === projectName);
+        if (!section) throw new Error(`未找到项目：${projectName}`);
+        const projectRows = Array.from(section.querySelectorAll(".codex-batch-row[data-title]"));
+        if (!projectRows.length) throw new Error(section.codexGroup.error || "项目中没有可导出的对话");
+        for (const row of projectRows) row.querySelector("input").checked = true;
+        updateSelection();
+        exportButton.click();
+      }
     }).catch(error => {
       if (!dialog.isConnected) return;
       list.textContent = "";
@@ -1387,7 +1404,7 @@
     return /^(?:删除(?:聊天)?|Delete(?: chat)?)(?:\s|$)/i.test((item.textContent || "").replace(/\s+/g, " ").trim());
   }
 
-  function createExportMenuItem(template, id, label) {
+  function createExportMenuItem(template, id, label, action) {
     const button = template.cloneNode(true);
     const walker = document.createTreeWalker(button, NodeFilter.SHOW_TEXT);
     let labelNode = walker.nextNode();
@@ -1416,7 +1433,7 @@
     button.addEventListener("click", event => {
       event.preventDefault();
       event.stopPropagation();
-      if (button.getAttribute("aria-disabled") !== "true") exportCurrentConversation(button, includeAttachmentsEnabled());
+      if (button.getAttribute("aria-disabled") !== "true") action(button);
     });
     if (button.tagName !== "BUTTON") {
       button.addEventListener("keydown", event => {
@@ -1426,11 +1443,115 @@
     return button;
   }
 
+  function closeNativeMenu(menu) {
+    document.getElementById(menu.getAttribute("aria-labelledby"))?.click();
+  }
+
+  function projectNameFromLabel(label) {
+    return label.match(/^打开\s*[“"]?(.+?)[”"]?\s*的项目选项$/)?.[1]?.trim() || "";
+  }
+
+  function projectNameFromMenu(menu) {
+    const label = document.getElementById(menu.getAttribute("aria-labelledby"))?.getAttribute("aria-label") || "";
+    return projectNameFromLabel(label);
+  }
+
+  function addBatchSubmenu(menu, exportButton, template) {
+    document.getElementById(BATCH_SUBMENU_ID)?.remove();
+    const submenu = menu.cloneNode(false);
+    submenu.id = BATCH_SUBMENU_ID;
+    submenu.removeAttribute("aria-labelledby");
+    submenu.removeAttribute("style");
+    submenu.setAttribute("aria-label", "导出方式");
+    submenu.hidden = true;
+    submenu.codexOwner = exportButton;
+    Object.assign(submenu.style, { position: "fixed", zIndex: "10000" });
+
+    let hideTimer;
+    const hide = immediate => {
+      clearTimeout(hideTimer);
+      const close = () => {
+        submenu.hidden = true;
+        exportButton.setAttribute("aria-expanded", "false");
+      };
+      if (immediate) close();
+      else hideTimer = setTimeout(close, 140);
+    };
+    const show = () => {
+      clearTimeout(hideTimer);
+      if (!exportButton.isConnected) return;
+      const rect = exportButton.getBoundingClientRect();
+      const width = Math.max(160, menu.getBoundingClientRect().width);
+      submenu.style.width = `${width}px`;
+      submenu.style.minWidth = `${width}px`;
+      submenu.hidden = false;
+      const left = rect.left - width - 6 >= 8 ? rect.left - width - 6 : Math.min(innerWidth - width - 8, rect.right + 6);
+      submenu.style.left = `${Math.max(8, left)}px`;
+      submenu.style.top = `${Math.max(8, Math.min(rect.top, innerHeight - submenu.offsetHeight - 8))}px`;
+      exportButton.setAttribute("aria-expanded", "true");
+    };
+
+    const batchButton = createExportMenuItem(template, `${BATCH_SUBMENU_ID}-button`, "批量导出", () => {
+      hide(true);
+      closeNativeMenu(menu);
+      openBatchExportDialog();
+    });
+    if (!batchButton) return;
+    submenu.appendChild(batchButton);
+    document.body.appendChild(submenu);
+
+    const chevron = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    chevron.setAttribute("viewBox", "0 0 16 16");
+    chevron.setAttribute("width", "16");
+    chevron.setAttribute("height", "16");
+    chevron.setAttribute("aria-hidden", "true");
+    chevron.style.marginInlineStart = "auto";
+    chevron.innerHTML = '<path d="M10 3.5 5.5 8l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>';
+    exportButton.appendChild(chevron);
+    exportButton.setAttribute("aria-haspopup", "menu");
+    exportButton.setAttribute("aria-expanded", "false");
+    exportButton.setAttribute("aria-controls", BATCH_SUBMENU_ID);
+    exportButton.addEventListener("mouseenter", show);
+    exportButton.addEventListener("mouseleave", () => hide(false));
+    exportButton.addEventListener("focus", show);
+    exportButton.addEventListener("blur", () => hide(false));
+    exportButton.addEventListener("click", () => hide(true));
+    exportButton.addEventListener("keydown", event => {
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        show();
+        batchButton.focus();
+      }
+    });
+    submenu.addEventListener("mouseenter", () => clearTimeout(hideTimer));
+    submenu.addEventListener("mouseleave", () => hide(false));
+  }
+
+  function addProjectExportButton(menu) {
+    if (menu.querySelector(`#${PROJECT_EXPORT_BUTTON_ID}`)) return true;
+    const projectName = projectNameFromMenu(menu);
+    if (!projectName) return false;
+    const items = Array.from(menu.querySelectorAll('[role="menuitem"]'));
+    const projectHome = items.find(item => /^(?:项目主页|Project home)$/i.test((item.textContent || "").trim()));
+    const template = projectHome || items[0];
+    if (!template) return false;
+    const button = createExportMenuItem(template, PROJECT_EXPORT_BUTTON_ID, "导出项目", () => {
+      closeNativeMenu(menu);
+      openBatchExportDialog(projectName);
+    });
+    if (!button) return false;
+    template.after(button);
+    return true;
+  }
+
   function addButton() {
-    if (document.getElementById(BUTTON_ID)) return;
+    const staleSubmenu = document.getElementById(BATCH_SUBMENU_ID);
+    if (staleSubmenu?.codexOwner && !staleSubmenu.codexOwner.isConnected) staleSubmenu.remove();
 
     for (const menu of document.querySelectorAll('[role="menu"]')) {
       if (!isRenderedMessageElement(menu)) continue;
+      if (addProjectExportButton(menu)) continue;
+      if (menu.querySelector(`#${BUTTON_ID}`)) continue;
       const items = Array.from(menu.querySelectorAll('[role="menuitem"]'));
       const deleteItem = items.find(isDeleteMenuItem);
       if (!deleteItem) continue;
@@ -1438,12 +1559,14 @@
       const template = items[Math.max(0, items.indexOf(deleteItem) - 1)];
       if (!template || template === deleteItem) continue;
 
-      const exportButton = createExportMenuItem(template, BUTTON_ID, "导出");
+      const exportButton = createExportMenuItem(template, BUTTON_ID, "导出", button => {
+        exportCurrentConversation(button, includeAttachmentsEnabled());
+      });
       if (!exportButton) continue;
 
       deleteItem.after(exportButton);
+      addBatchSubmenu(menu, exportButton, template);
       if (!location.pathname.includes("/share/")) void apiHeaders().then(fetchedConversation).catch(() => {});
-      return;
     }
   }
 
@@ -1644,6 +1767,7 @@
     assert(fixedCitation === "[官方仓库](https://github.com/deepseek-ai/deepseek-harness)", "内容引用元数据");
     assert(generatedImage.startsWith("![actual-image.webp]("), "DALL-E 图片使用实际文件名");
     assert(isDeleteMenuItem({ textContent: "删除聊天" }) && isDeleteMenuItem({ textContent: "Delete chat" }), "识别删除菜单项");
+    assert(projectNameFromLabel("打开 八股 的项目选项") === "八股", "识别项目菜单名称");
     assert(!/[\uE200-\uE204]/u.test(fixedLink), "残余引用控制字符");
   }
 
@@ -1658,7 +1782,7 @@
   selfCheck();
   void selfCheckBatch();
   registerExportSettings();
-  GM_registerMenuCommand("批量导出…", openBatchExportDialog, { title: "选择对话或整个项目并导出 ZIP" });
+  GM_registerMenuCommand("批量导出…", () => openBatchExportDialog(), { title: "选择对话或整个项目并导出 ZIP" });
   if (!location.pathname.includes("/share/")) void apiHeaders().then(fetchedConversation).catch(() => {});
   if (document.body) observeMenuButton();
   else window.addEventListener("DOMContentLoaded", observeMenuButton, { once: true });
