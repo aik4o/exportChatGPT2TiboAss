@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 当前会话导出 Markdown
 // @namespace    https://chatgpt.com/
-// @version      3.2.4
+// @version      3.2.5
 // @description  从原始会话数据导出 Markdown，保留代码、Mermaid、公式、图片和附件。
 // @match        https://chatgpt.com/*
 // @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
@@ -20,7 +20,7 @@
   const PROJECT_EXPORT_BUTTON_ID = "codex-project-export-button";
   const MESSAGE_SELECTOR = "[data-message-author-role][data-message-id]";
   const EXPORT_ATTACHMENTS_KEY = "export-attachments";
-  const SCRIPT_VERSION = "3.2.4";
+  const SCRIPT_VERSION = "3.2.5";
   let exportSettingsCommandId;
   let apiHeadersPromise;
   let conversationCache;
@@ -1127,7 +1127,7 @@
       .filter(item => !claimed.has(item.id))
       .map(item => ({ ...item, groupName: "其他对话" }));
     if (!projectName && (ungrouped.length || conversationIndex.hasMore)) {
-      groups.unshift({
+      groups.push({
         id: "",
         name: "其他对话",
         items: ungrouped,
