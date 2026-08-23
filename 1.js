@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 当前会话导出 Markdown
 // @namespace    https://chatgpt.com/
-// @version      3.2.1
+// @version      3.2.2
 // @description  从原始会话数据导出 Markdown，保留代码、Mermaid、公式、图片和附件。
 // @match        https://chatgpt.com/*
 // @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
@@ -20,7 +20,7 @@
   const PROJECT_EXPORT_BUTTON_ID = "codex-project-export-button";
   const MESSAGE_SELECTOR = "[data-message-author-role][data-message-id]";
   const EXPORT_ATTACHMENTS_KEY = "export-attachments";
-  const SCRIPT_VERSION = "3.2.1";
+  const SCRIPT_VERSION = "3.2.2";
   let exportSettingsCommandId;
   let apiHeadersPromise;
   let conversationCache;
@@ -1596,14 +1596,11 @@
     submenu.appendChild(batchButton);
     document.body.appendChild(submenu);
 
-    const chevron = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    chevron.setAttribute("viewBox", "0 0 16 16");
-    chevron.setAttribute("width", "16");
-    chevron.setAttribute("height", "16");
-    chevron.setAttribute("aria-hidden", "true");
-    chevron.style.marginInlineStart = "auto";
-    chevron.innerHTML = '<path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>';
-    exportButton.appendChild(chevron);
+    const chevron = menu.querySelector('[data-testid="menu-item-submenu-chevron"]')?.cloneNode(true);
+    if (chevron) {
+      chevron.removeAttribute("data-testid");
+      exportButton.appendChild(chevron);
+    }
     exportButton.setAttribute("aria-haspopup", "menu");
     exportButton.setAttribute("aria-expanded", "false");
     exportButton.setAttribute("aria-controls", BATCH_SUBMENU_ID);
