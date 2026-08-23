@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 当前会话导出 Markdown
 // @namespace    https://chatgpt.com/
-// @version      2.14.0
+// @version      3.0.0
 // @description  从原始会话数据导出 Markdown，保留代码、Mermaid、公式、图片和附件。
 // @match        https://chatgpt.com/*
 // @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
@@ -15,9 +15,10 @@
   "use strict";
 
   const BUTTON_ID = "codex-markdown-export-button";
+  const BATCH_DIALOG_ID = "codex-batch-export-dialog";
   const MESSAGE_SELECTOR = "[data-message-author-role][data-message-id]";
   const EXPORT_ATTACHMENTS_KEY = "export-attachments";
-  const SCRIPT_VERSION = "2.14.0";
+  const SCRIPT_VERSION = "3.0.0";
   let exportSettingsCommandId;
   let apiHeadersPromise;
   let conversationCache;
@@ -159,28 +160,109 @@
     return cache?.id === id && cache.revision === revision;
   }
 
+  async function fetchConversationById(id, headers) {
+    const response = await fetch(`/backend-api/conversation/${encodeURIComponent(id)}`, {
+      credentials: "include",
+      cache: "no-store",
+      headers,
+    });
+
+    if (!response.ok) throw new Error(`读取会话失败（HTTP ${response.status}）`);
+    const data = await response.json();
+    if (!data?.mapping || !data?.current_node) throw new Error("会话数据结构不完整");
+    return data;
+  }
+
   function fetchedConversation(headers) {
     const id = conversationId();
     if (!id) return Promise.resolve(null);
     const revision = pageConversationRevision();
     if (isFreshConversationCache(conversationCache, id, revision)) return conversationCache.promise;
 
-    const promise = (async () => {
-      const response = await fetch(`/backend-api/conversation/${id}`, {
-        credentials: "include",
-        cache: "no-store",
-        headers,
-      });
-
-      if (!response.ok) throw new Error(`读取原始会话失败（HTTP ${response.status}）`);
-      const data = await response.json();
-      if (!data?.mapping || !data?.current_node) throw new Error("原始会话数据结构不完整");
-      return data;
-    })();
+    const promise = fetchConversationById(id, headers);
 
     conversationCache = { id, revision, promise };
     promise.catch(() => { if (conversationCache?.promise === promise) conversationCache = null; });
     return promise;
+  }
+
+  async function fetchConversationIndex(headers) {
+    const items = [];
+    const seen = new Set();
+    const limit = 100;
+
+    for (let offset = 0; ; offset += limit) {
+      const response = await fetch(`/backend-api/conversations?offset=${offset}&limit=${limit}&order=updated`, {
+        credentials: "include",
+        cache: "no-store",
+        headers,
+      });
+      if (!response.ok) throw new Error(`读取对话列表失败（HTTP ${response.status}）`);
+      const page = await response.json();
+      const pageItems = Array.isArray(page.items) ? page.items : [];
+      const novel = pageItems.filter(item => item?.id && !seen.has(item.id));
+      novel.forEach(item => seen.add(item.id));
+      items.push(...novel);
+      if (!pageItems.length || pageItems.length < limit || !novel.length || (Number.isFinite(page.total) && items.length >= page.total)) break;
+    }
+    return items;
+  }
+
+  async function fetchProjects(headers) {
+    const projects = [];
+    const seenIds = new Set();
+    const seenCursors = new Set();
+    let cursor = null;
+
+    do {
+      const params = new URLSearchParams({ conversations_per_gizmo: "0" });
+      if (cursor != null) params.set("cursor", String(cursor));
+      const response = await fetch(`/backend-api/gizmos/snorlax/sidebar?${params}`, {
+        credentials: "include",
+        cache: "no-store",
+        headers,
+      });
+      if (!response.ok) throw new Error(`读取项目列表失败（HTTP ${response.status}）`);
+      const page = await response.json();
+      for (const item of Array.isArray(page.items) ? page.items : []) {
+        const project = item?.gizmo?.gizmo || item?.gizmo || item;
+        if (project?.id && !seenIds.has(project.id)) {
+          seenIds.add(project.id);
+          projects.push({ id: project.id, name: project.display?.name || project.name || "未命名项目" });
+        }
+      }
+      cursor = page.cursor ?? null;
+      if (cursor == null || seenCursors.has(String(cursor))) break;
+      seenCursors.add(String(cursor));
+    } while (true);
+    return projects;
+  }
+
+  async function fetchProjectConversations(projectId, headers) {
+    const items = [];
+    const seenIds = new Set();
+    const seenCursors = new Set();
+    let cursor = 0;
+
+    do {
+      const params = new URLSearchParams({ cursor: String(cursor), limit: "50" });
+      const response = await fetch(`/backend-api/gizmos/${encodeURIComponent(projectId)}/conversations?${params}`, {
+        credentials: "include",
+        cache: "no-store",
+        headers,
+      });
+      if (!response.ok) throw new Error(`读取项目对话失败（HTTP ${response.status}）`);
+      const page = await response.json();
+      const pageItems = Array.isArray(page.items) ? page.items : [];
+      const novel = pageItems.filter(item => item?.id && !seenIds.has(item.id));
+      novel.forEach(item => seenIds.add(item.id));
+      items.push(...novel);
+      const next = page.cursor ?? null;
+      if (!pageItems.length || next == null || seenCursors.has(String(next))) break;
+      seenCursors.add(String(next));
+      cursor = next;
+    } while (true);
+    return items;
   }
 
   function fileDownloadUrl(pointer) {
@@ -928,10 +1010,10 @@
       .slice(0, 180) || "ChatGPT-附件";
   }
 
-  function buildMarkdown(messages, preferredTitle = "", sourceMode = "", warning = "") {
+  function buildMarkdown(messages, preferredTitle = "", sourceMode = "", warning = "", sourceUrl = "") {
     const title = conversationTitle(preferredTitle);
     const exportedAt = new Date().toLocaleString("zh-CN", { hour12: false });
-    const source = location.href.split("#")[0];
+    const source = sourceUrl || location.href.split("#")[0];
     const sections = messages.map((message, index) => {
       const author = message.role === "user" ? "用户" : "ChatGPT";
       return `## ${index + 1}. ${author}\n\n${sealMarkdown(message.content)}`;
@@ -985,6 +1067,278 @@
     const archiveName = `${baseName}.zip`;
     downloadBlob(blob, archiveName);
     return archiveName;
+  }
+
+  async function mapConcurrent(items, limit, task) {
+    const results = new Array(items.length);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) {
+        const index = next++;
+        results[index] = await task(items[index], index);
+      }
+    }));
+    return results;
+  }
+
+  async function loadBatchGroups() {
+    const headers = await apiHeaders();
+    const [regularItems, projects] = await Promise.all([
+      fetchConversationIndex(headers),
+      fetchProjects(headers),
+    ]);
+    const projectGroups = await mapConcurrent(projects, 4, async project => {
+      try {
+        return { id: project.id, name: project.name, items: await fetchProjectConversations(project.id, headers) };
+      } catch (error) {
+        return { id: project.id, name: project.name, items: [], error: error instanceof Error ? error.message : "读取失败" };
+      }
+    });
+
+    const claimed = new Set(projectGroups.flatMap(group => group.items.map(item => item.id)));
+    const groups = projectGroups.map(group => ({
+      ...group,
+      items: group.items.map(item => ({ ...item, groupName: group.name })),
+    }));
+    const ungrouped = regularItems
+      .filter(item => !claimed.has(item.id))
+      .map(item => ({ ...item, groupName: "其他对话" }));
+    if (ungrouped.length) groups.push({ id: "", name: "其他对话", items: ungrouped });
+    return { headers, groups };
+  }
+
+  async function exportBatchConversations(items, includeAttachments, onProgress) {
+    if (typeof JSZip !== "function") throw new Error("压缩组件加载失败，请刷新页面后重试");
+    const headers = await apiHeaders();
+    const zip = new JSZip();
+    const root = zip.folder("ChatGPT 批量导出");
+    const failures = [];
+    let completed = 0;
+    let exported = 0;
+
+    await mapConcurrent(items, includeAttachments ? 2 : 4, async item => {
+      try {
+        const conversation = await fetchConversationById(item.id, headers);
+        const assets = await hydrateConversationAssets(conversation, null, headers, includeAttachments);
+        const messages = messagesFromConversation(conversation);
+        if (!messages.length) throw new Error("没有可导出的消息");
+
+        const warnings = assets.failed
+          ? `${assets.failed} 个附件或图片未能保存，Markdown 已保留在线链接或资源标识。`
+          : "";
+        const title = conversation.title || item.title || "ChatGPT 会话";
+        const baseName = safeFilename(conversationTitle(title)).replace(/\.md$/i, "");
+        const uniqueName = `${baseName} - ${String(item.id).slice(0, 8)}`;
+        const groupName = safeAttachmentFilename(item.groupName || "其他对话");
+        const markdown = buildMarkdown(
+          messages,
+          title,
+          "ChatGPT 原始会话接口（批量）",
+          warnings,
+          `${location.origin}/c/${encodeURIComponent(item.id)}`
+        );
+
+        if (includeAttachments) {
+          const directory = root.folder(`${groupName}/${uniqueName}`);
+          directory.file(`${baseName}.md`, markdown);
+          for (const attachment of assets.downloads) directory.file(attachment.name, attachment.blob);
+        } else {
+          root.folder(groupName).file(`${uniqueName}.md`, markdown);
+        }
+        exported += 1;
+      } catch (error) {
+        failures.push(`${item.title || item.id}：${error instanceof Error ? error.message : "导出失败"}`);
+      } finally {
+        completed += 1;
+        onProgress?.(completed, items.length);
+      }
+    });
+
+    if (!exported) throw new Error(failures[0] || "没有成功导出任何对话");
+    if (failures.length) root.file("_导出失败.txt", failures.join("\n"));
+    const blob = await zip.generateAsync({ type: "blob" });
+    const archiveName = `ChatGPT 批量导出 ${new Date().toISOString().slice(0, 10)}.zip`;
+    downloadBlob(blob, archiveName);
+    return { archiveName, exported, failed: failures.length };
+  }
+
+  function ensureBatchExportStyle() {
+    if (document.getElementById(`${BATCH_DIALOG_ID}-style`)) return;
+    const style = document.createElement("style");
+    style.id = `${BATCH_DIALOG_ID}-style`;
+    style.textContent = `
+      #${BATCH_DIALOG_ID} { color-scheme: light dark; width: min(760px, calc(100vw - 32px)); max-height: min(760px, calc(100vh - 32px)); padding: 0; color: var(--text-primary, #0d0d0d); background: var(--main-surface-primary, #fff); border: 1px solid var(--border-medium, rgba(0,0,0,.15)); border-radius: 18px; box-shadow: 0 24px 80px rgba(0,0,0,.28); }
+      #${BATCH_DIALOG_ID}::backdrop { background: rgba(0,0,0,.5); backdrop-filter: blur(2px); }
+      #${BATCH_DIALOG_ID} .codex-batch-layout { display: flex; flex-direction: column; max-height: min(760px, calc(100vh - 32px)); }
+      #${BATCH_DIALOG_ID} .codex-batch-header, #${BATCH_DIALOG_ID} .codex-batch-toolbar, #${BATCH_DIALOG_ID} .codex-batch-footer { display: flex; align-items: center; gap: 12px; padding: 14px 18px; }
+      #${BATCH_DIALOG_ID} .codex-batch-header { justify-content: space-between; border-bottom: 1px solid var(--border-light, rgba(0,0,0,.1)); }
+      #${BATCH_DIALOG_ID} h2 { margin: 0; font-size: 18px; }
+      #${BATCH_DIALOG_ID} button, #${BATCH_DIALOG_ID} input { font: inherit; }
+      #${BATCH_DIALOG_ID} button { color: inherit; background: transparent; border: 0; border-radius: 9px; padding: 8px 12px; cursor: pointer; }
+      #${BATCH_DIALOG_ID} button:hover { background: var(--surface-hover, rgba(0,0,0,.08)); }
+      #${BATCH_DIALOG_ID} button:disabled { cursor: default; opacity: .5; }
+      #${BATCH_DIALOG_ID} [data-export] { color: white; background: #10a37f; }
+      #${BATCH_DIALOG_ID} [data-export]:hover { background: #0d8f70; }
+      #${BATCH_DIALOG_ID} .codex-batch-toolbar { flex-wrap: wrap; border-bottom: 1px solid var(--border-light, rgba(0,0,0,.1)); }
+      #${BATCH_DIALOG_ID} [data-search] { flex: 1 1 260px; min-width: 0; color: inherit; background: var(--main-surface-secondary, rgba(0,0,0,.04)); border: 1px solid var(--border-medium, rgba(0,0,0,.15)); border-radius: 10px; padding: 9px 11px; }
+      #${BATCH_DIALOG_ID} .codex-batch-list { flex: 1; overflow: auto; padding: 10px 12px; }
+      #${BATCH_DIALOG_ID} .codex-batch-group { margin-bottom: 10px; border: 1px solid var(--border-light, rgba(0,0,0,.1)); border-radius: 12px; overflow: hidden; }
+      #${BATCH_DIALOG_ID} .codex-batch-group-title { display: flex; gap: 9px; align-items: center; padding: 10px 12px; font-weight: 600; background: var(--main-surface-secondary, rgba(0,0,0,.04)); }
+      #${BATCH_DIALOG_ID} .codex-batch-row { display: flex; gap: 9px; align-items: center; padding: 9px 12px 9px 34px; cursor: pointer; }
+      #${BATCH_DIALOG_ID} .codex-batch-row:hover { background: var(--surface-hover, rgba(0,0,0,.06)); }
+      #${BATCH_DIALOG_ID} .codex-batch-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #${BATCH_DIALOG_ID} .codex-batch-error { padding: 10px 12px 10px 34px; color: var(--text-error, #ef4444); }
+      #${BATCH_DIALOG_ID} .codex-batch-footer { justify-content: space-between; border-top: 1px solid var(--border-light, rgba(0,0,0,.1)); }
+      #${BATCH_DIALOG_ID} [data-status] { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function openBatchExportDialog() {
+    const existing = document.getElementById(BATCH_DIALOG_ID);
+    if (existing) {
+      if (!existing.open) existing.showModal();
+      return;
+    }
+    ensureBatchExportStyle();
+
+    const dialog = document.createElement("dialog");
+    dialog.id = BATCH_DIALOG_ID;
+    dialog.innerHTML = `
+      <div class="codex-batch-layout">
+        <div class="codex-batch-header"><h2>批量导出</h2><button type="button" data-close aria-label="关闭">✕</button></div>
+        <div class="codex-batch-toolbar">
+          <input type="search" data-search placeholder="搜索对话或项目" aria-label="搜索对话或项目">
+          <label><input type="checkbox" data-select-all> 全选当前结果</label>
+        </div>
+        <div class="codex-batch-list" data-list><div class="codex-batch-row">正在读取对话和项目…</div></div>
+        <div class="codex-batch-footer"><span data-status>加载中…</span><button type="button" data-export disabled>导出选中</button></div>
+      </div>`;
+    document.body.appendChild(dialog);
+
+    const list = dialog.querySelector("[data-list]");
+    const search = dialog.querySelector("[data-search]");
+    const selectAll = dialog.querySelector("[data-select-all]");
+    const status = dialog.querySelector("[data-status]");
+    const exportButton = dialog.querySelector("[data-export]");
+    const closeButton = dialog.querySelector("[data-close]");
+    let exporting = false;
+
+    const rows = () => Array.from(dialog.querySelectorAll(".codex-batch-row[data-title]"));
+    const updateSelection = () => {
+      const allRows = rows();
+      const visibleRows = allRows.filter(row => !row.hidden);
+      const checked = allRows.filter(row => row.querySelector("input").checked);
+      for (const section of dialog.querySelectorAll(".codex-batch-group")) {
+        const groupRows = Array.from(section.querySelectorAll(".codex-batch-row[data-title]"));
+        const selected = groupRows.filter(row => row.querySelector("input").checked).length;
+        const groupCheckbox = section.querySelector(".codex-batch-group-title input");
+        groupCheckbox.checked = !!groupRows.length && selected === groupRows.length;
+        groupCheckbox.indeterminate = selected > 0 && selected < groupRows.length;
+      }
+      const visibleChecked = visibleRows.filter(row => row.querySelector("input").checked).length;
+      selectAll.checked = !!visibleRows.length && visibleChecked === visibleRows.length;
+      selectAll.indeterminate = visibleChecked > 0 && visibleChecked < visibleRows.length;
+      exportButton.disabled = exporting || !checked.length;
+      if (!exporting) status.textContent = `已选择 ${checked.length} / ${allRows.length} 个对话`;
+    };
+
+    closeButton.addEventListener("click", () => dialog.close());
+    dialog.addEventListener("cancel", event => { if (exporting) event.preventDefault(); });
+    dialog.addEventListener("close", () => dialog.remove());
+    search.addEventListener("input", () => {
+      const query = search.value.trim().toLocaleLowerCase();
+      for (const row of rows()) row.hidden = !!query && !row.dataset.title.includes(query);
+      for (const section of dialog.querySelectorAll(".codex-batch-group")) {
+        const titleMatches = section.dataset.title.includes(query);
+        if (titleMatches) for (const row of section.querySelectorAll(".codex-batch-row[data-title]")) row.hidden = false;
+        section.hidden = !Array.from(section.querySelectorAll(".codex-batch-row[data-title]")).some(row => !row.hidden);
+      }
+      updateSelection();
+    });
+    selectAll.addEventListener("change", () => {
+      for (const row of rows().filter(row => !row.hidden)) row.querySelector("input").checked = selectAll.checked;
+      updateSelection();
+    });
+
+    exportButton.addEventListener("click", async () => {
+      const selected = rows().filter(row => row.querySelector("input").checked).map(row => row.codexConversation);
+      if (!selected.length) return;
+      exporting = true;
+      closeButton.disabled = true;
+      search.disabled = true;
+      selectAll.disabled = true;
+      exportButton.disabled = true;
+      list.inert = true;
+      try {
+        const result = await exportBatchConversations(selected, includeAttachmentsEnabled(), (done, total) => {
+          status.textContent = `正在导出 ${done} / ${total}…`;
+        });
+        status.textContent = `已导出 ${result.exported} 个对话${result.failed ? `，失败 ${result.failed} 个` : ""}`;
+        exportButton.textContent = "导出完成";
+      } catch (error) {
+        status.textContent = error instanceof Error ? error.message : "批量导出失败";
+        status.style.color = "var(--text-error, #ef4444)";
+      } finally {
+        exporting = false;
+        closeButton.disabled = false;
+        search.disabled = false;
+        selectAll.disabled = false;
+        list.inert = false;
+        exportButton.disabled = !selected.length;
+      }
+    });
+
+    dialog.showModal();
+    void loadBatchGroups().then(({ groups }) => {
+      if (!dialog.isConnected) return;
+      list.replaceChildren();
+      const fragment = document.createDocumentFragment();
+      for (const group of groups) {
+        const section = document.createElement("section");
+        section.className = "codex-batch-group";
+        section.dataset.title = group.name.toLocaleLowerCase();
+        const heading = document.createElement("label");
+        heading.className = "codex-batch-group-title";
+        const groupCheckbox = document.createElement("input");
+        groupCheckbox.type = "checkbox";
+        heading.append(groupCheckbox, document.createTextNode(`${group.name}（${group.items.length}）`));
+        section.appendChild(heading);
+        groupCheckbox.addEventListener("change", () => {
+          for (const row of section.querySelectorAll(".codex-batch-row[data-title]")) row.querySelector("input").checked = groupCheckbox.checked;
+          updateSelection();
+        });
+
+        for (const item of group.items) {
+          const row = document.createElement("label");
+          row.className = "codex-batch-row";
+          row.dataset.title = `${item.title || "未命名对话"} ${group.name}`.toLocaleLowerCase();
+          row.codexConversation = item;
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.addEventListener("change", updateSelection);
+          const title = document.createElement("span");
+          title.textContent = item.title || "未命名对话";
+          title.title = title.textContent;
+          row.append(checkbox, title);
+          section.appendChild(row);
+        }
+        if (group.error) {
+          const error = document.createElement("div");
+          error.className = "codex-batch-error";
+          error.textContent = group.error;
+          section.appendChild(error);
+        }
+        fragment.appendChild(section);
+      }
+      list.appendChild(fragment);
+      updateSelection();
+    }).catch(error => {
+      if (!dialog.isConnected) return;
+      list.textContent = "";
+      status.textContent = error instanceof Error ? error.message : "读取对话列表失败";
+      status.style.color = "var(--text-error, #ef4444)";
+    });
   }
 
   function showStatus(button, text, error = false) {
@@ -1293,8 +1647,18 @@
     assert(!/[\uE200-\uE204]/u.test(fixedLink), "残余引用控制字符");
   }
 
+  async function selfCheckBatch() {
+    const values = await mapConcurrent([1, 2, 3], 2, async value => value * 2);
+    if (values.join(",") !== "2,4,6") throw new Error("ChatGPT Markdown 导出脚本自检失败：批量并发顺序");
+    const zip = new JSZip();
+    zip.folder("ChatGPT 批量导出").folder("测试项目").folder("测试对话").file("测试对话.md", "test");
+    if (!zip.file("ChatGPT 批量导出/测试项目/测试对话/测试对话.md")) throw new Error("ChatGPT Markdown 导出脚本自检失败：项目与对话文件夹层级");
+  }
+
   selfCheck();
+  void selfCheckBatch();
   registerExportSettings();
+  GM_registerMenuCommand("批量导出…", openBatchExportDialog, { title: "选择对话或整个项目并导出 ZIP" });
   if (!location.pathname.includes("/share/")) void apiHeaders().then(fetchedConversation).catch(() => {});
   if (document.body) observeMenuButton();
   else window.addEventListener("DOMContentLoaded", observeMenuButton, { once: true });
