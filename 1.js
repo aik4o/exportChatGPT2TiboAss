@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 当前会话导出 Markdown
 // @namespace    https://chatgpt.com/
-// @version      3.2.3
+// @version      3.2.4
 // @description  从原始会话数据导出 Markdown，保留代码、Mermaid、公式、图片和附件。
 // @match        https://chatgpt.com/*
 // @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
@@ -20,7 +20,7 @@
   const PROJECT_EXPORT_BUTTON_ID = "codex-project-export-button";
   const MESSAGE_SELECTOR = "[data-message-author-role][data-message-id]";
   const EXPORT_ATTACHMENTS_KEY = "export-attachments";
-  const SCRIPT_VERSION = "3.2.3";
+  const SCRIPT_VERSION = "3.2.4";
   let exportSettingsCommandId;
   let apiHeadersPromise;
   let conversationCache;
@@ -1587,12 +1587,21 @@
       exportButton.setAttribute("aria-expanded", "true");
     };
 
-    const batchButton = createExportMenuItem(template, `${BATCH_SUBMENU_ID}-button`, "批量导出", () => {
+    let openingBatch = false;
+    const openBatch = () => {
+      if (openingBatch) return;
+      openingBatch = true;
       hide(true);
       closeNativeMenu(menu);
       openBatchExportDialog();
-    });
+    };
+    const batchButton = createExportMenuItem(template, `${BATCH_SUBMENU_ID}-button`, "批量导出", openBatch);
     if (!batchButton) return;
+    batchButton.addEventListener("pointerdown", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      openBatch();
+    });
     submenu.appendChild(batchButton);
     document.body.appendChild(submenu);
 
