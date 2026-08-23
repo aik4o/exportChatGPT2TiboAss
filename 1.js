@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 当前会话导出 Markdown
 // @namespace    https://chatgpt.com/
-// @version      3.1.0
+// @version      3.2.0
 // @description  从原始会话数据导出 Markdown，保留代码、Mermaid、公式、图片和附件。
 // @match        https://chatgpt.com/*
 // @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
@@ -20,7 +20,7 @@
   const PROJECT_EXPORT_BUTTON_ID = "codex-project-export-button";
   const MESSAGE_SELECTOR = "[data-message-author-role][data-message-id]";
   const EXPORT_ATTACHMENTS_KEY = "export-attachments";
-  const SCRIPT_VERSION = "3.1.0";
+  const SCRIPT_VERSION = "3.2.0";
   let exportSettingsCommandId;
   let apiHeadersPromise;
   let conversationCache;
@@ -188,10 +188,11 @@
     return promise;
   }
 
-  async function fetchConversationIndex(headers) {
+  async function fetchConversationIndex(headers, maxItems = Number.POSITIVE_INFINITY) {
     const items = [];
     const seen = new Set();
     const limit = 100;
+    let hasMore = false;
 
     for (let offset = 0; ; offset += limit) {
       const response = await fetch(`/backend-api/conversations?offset=${offset}&limit=${limit}&order=updated`, {
@@ -206,8 +207,12 @@
       novel.forEach(item => seen.add(item.id));
       items.push(...novel);
       if (!pageItems.length || pageItems.length < limit || !novel.length || (Number.isFinite(page.total) && items.length >= page.total)) break;
+      if (items.length >= maxItems) {
+        hasMore = true;
+        break;
+      }
     }
-    return items;
+    return { items: items.slice(0, maxItems), hasMore };
   }
 
   async function fetchProjects(headers) {
@@ -1085,20 +1090,33 @@
 
   async function loadBatchGroups(projectName = "") {
     const headers = await apiHeaders();
-    const [regularItems, projects] = await Promise.all([
-      projectName ? Promise.resolve([]) : fetchConversationIndex(headers),
+    const [conversationIndex, projects] = await Promise.all([
+      projectName ? Promise.resolve({ items: [], hasMore: false }) : fetchConversationIndex(headers, 100),
       fetchProjects(headers),
     ]);
+    const regularItems = conversationIndex.items;
     // ponytail: 项目菜单只暴露名称；若 ChatGPT 允许重名项目，再按侧栏顺序补充 ID 匹配。
     const selectedProjects = projectName ? projects.filter(project => project.name === projectName).slice(0, 1) : projects;
     if (projectName && !selectedProjects.length) throw new Error(`未找到项目：${projectName}`);
-    const projectGroups = await mapConcurrent(selectedProjects, 4, async project => {
-      try {
-        return { id: project.id, name: project.name, items: await fetchProjectConversations(project.id, headers) };
-      } catch (error) {
-        return { id: project.id, name: project.name, items: [], error: error instanceof Error ? error.message : "读取失败" };
-      }
-    });
+    let projectGroups;
+    if (projectName) {
+      projectGroups = await mapConcurrent(selectedProjects, 1, async project => {
+        try {
+          return { id: project.id, name: project.name, items: await fetchProjectConversations(project.id, headers), loaded: true };
+        } catch (error) {
+          return { id: project.id, name: project.name, items: [], loaded: true, error: error instanceof Error ? error.message : "读取失败" };
+        }
+      });
+    } else {
+      const knownItems = new Map(selectedProjects.map(project => [project.id, []]));
+      for (const item of regularItems) knownItems.get(item.gizmo_id)?.push(item);
+      projectGroups = selectedProjects.map(project => ({
+        id: project.id,
+        name: project.name,
+        items: knownItems.get(project.id),
+        loaded: false,
+      }));
+    }
 
     const claimed = new Set(projectGroups.flatMap(group => group.items.map(item => item.id)));
     const groups = projectGroups.map(group => ({
@@ -1108,7 +1126,15 @@
     const ungrouped = regularItems
       .filter(item => !claimed.has(item.id))
       .map(item => ({ ...item, groupName: "其他对话" }));
-    if (!projectName && ungrouped.length) groups.push({ id: "", name: "其他对话", items: ungrouped });
+    if (!projectName && (ungrouped.length || conversationIndex.hasMore)) {
+      groups.unshift({
+        id: "",
+        name: "其他对话",
+        items: ungrouped,
+        loaded: !conversationIndex.hasMore,
+        projectIds: new Set(projects.map(project => project.id)),
+      });
+    }
     return { headers, groups };
   }
 
@@ -1189,6 +1215,7 @@
       #${BATCH_DIALOG_ID} .codex-batch-list { flex: 1; overflow: auto; padding: 10px 12px; }
       #${BATCH_DIALOG_ID} .codex-batch-group { margin-bottom: 10px; border: 1px solid var(--border-light, rgba(0,0,0,.1)); border-radius: 12px; overflow: hidden; }
       #${BATCH_DIALOG_ID} .codex-batch-group-title { display: flex; gap: 9px; align-items: center; padding: 10px 12px; font-weight: 600; background: var(--main-surface-secondary, rgba(0,0,0,.04)); }
+      #${BATCH_DIALOG_ID} [data-load-project] { margin-inline-start: auto; padding: 4px 8px; font-weight: 400; }
       #${BATCH_DIALOG_ID} .codex-batch-row { display: flex; gap: 9px; align-items: center; padding: 9px 12px 9px 34px; cursor: pointer; }
       #${BATCH_DIALOG_ID} .codex-batch-row:hover { background: var(--surface-hover, rgba(0,0,0,.06)); }
       #${BATCH_DIALOG_ID} .codex-batch-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1296,10 +1323,73 @@
     });
 
     dialog.showModal();
-    void loadBatchGroups(projectName).then(({ groups }) => {
+    void loadBatchGroups(projectName).then(({ headers, groups }) => {
       if (!dialog.isConnected) return;
       list.replaceChildren();
       const fragment = document.createDocumentFragment();
+      const appendRow = (section, item, checked = false) => {
+        const row = document.createElement("label");
+        row.className = "codex-batch-row";
+        row.dataset.title = `${item.title || "未命名对话"} ${section.codexGroup.name}`.toLocaleLowerCase();
+        row.codexConversation = item;
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = checked;
+        checkbox.addEventListener("change", updateSelection);
+        const title = document.createElement("span");
+        title.textContent = item.title || "未命名对话";
+        title.title = title.textContent;
+        row.append(checkbox, title);
+        section.appendChild(row);
+      };
+      const loadProjectSection = async (section, selectAfter = false) => {
+        const group = section.codexGroup;
+        const groupCheckbox = section.querySelector(".codex-batch-group-title input");
+        if (group.loaded) {
+          if (selectAfter) for (const row of section.querySelectorAll(".codex-batch-row[data-title]")) row.querySelector("input").checked = true;
+          updateSelection();
+          return;
+        }
+        if (group.loadingPromise) return group.loadingPromise;
+
+        const selectedIds = new Set(Array.from(section.querySelectorAll(".codex-batch-row[data-title]"))
+          .filter(row => row.querySelector("input").checked)
+          .map(row => row.codexConversation.id));
+        const loadButton = section.querySelector("[data-load-project]");
+        groupCheckbox.disabled = true;
+        if (loadButton) {
+          loadButton.disabled = true;
+          loadButton.textContent = "加载中…";
+        }
+        status.style.color = "";
+        status.textContent = `正在加载“${group.name}”…`;
+
+        const loadItems = group.id
+          ? fetchProjectConversations(group.id, headers)
+          : fetchConversationIndex(headers).then(result => result.items.filter(item => !group.projectIds.has(item.gizmo_id)));
+        group.loadingPromise = loadItems.then(items => {
+          group.items = items.map(item => ({ ...item, groupName: group.name }));
+          group.loaded = true;
+          for (const row of section.querySelectorAll(".codex-batch-row[data-title]")) row.remove();
+          for (const item of group.items) appendRow(section, item, selectAfter || selectedIds.has(item.id));
+          section.querySelector("[data-group-label]").textContent = `${group.name}（${group.items.length}）`;
+          loadButton?.remove();
+          groupCheckbox.disabled = false;
+          updateSelection();
+        }).catch(error => {
+          groupCheckbox.disabled = false;
+          groupCheckbox.checked = false;
+          if (loadButton) {
+            loadButton.disabled = false;
+            loadButton.textContent = "重试";
+          }
+          updateSelection();
+          status.textContent = error instanceof Error ? error.message : "读取项目对话失败";
+          status.style.color = "var(--text-error, #ef4444)";
+        }).finally(() => { group.loadingPromise = null; });
+        return group.loadingPromise;
+      };
+
       for (const group of groups) {
         const section = document.createElement("section");
         section.className = "codex-batch-group";
@@ -1309,27 +1399,33 @@
         heading.className = "codex-batch-group-title";
         const groupCheckbox = document.createElement("input");
         groupCheckbox.type = "checkbox";
-        heading.append(groupCheckbox, document.createTextNode(`${group.name}（${group.items.length}）`));
+        const groupLabel = document.createElement("span");
+        groupLabel.dataset.groupLabel = "";
+        groupLabel.textContent = `${group.name}（${group.items.length}${group.loaded ? "" : "+"}）`;
+        heading.append(groupCheckbox, groupLabel);
+        if (!group.loaded) {
+          const loadButton = document.createElement("button");
+          loadButton.type = "button";
+          loadButton.dataset.loadProject = "";
+          loadButton.textContent = "加载全部";
+          loadButton.addEventListener("click", event => {
+            event.preventDefault();
+            event.stopPropagation();
+            void loadProjectSection(section);
+          });
+          heading.appendChild(loadButton);
+        }
         section.appendChild(heading);
         groupCheckbox.addEventListener("change", () => {
+          if (groupCheckbox.checked && !group.loaded) {
+            void loadProjectSection(section, true);
+            return;
+          }
           for (const row of section.querySelectorAll(".codex-batch-row[data-title]")) row.querySelector("input").checked = groupCheckbox.checked;
           updateSelection();
         });
 
-        for (const item of group.items) {
-          const row = document.createElement("label");
-          row.className = "codex-batch-row";
-          row.dataset.title = `${item.title || "未命名对话"} ${group.name}`.toLocaleLowerCase();
-          row.codexConversation = item;
-          const checkbox = document.createElement("input");
-          checkbox.type = "checkbox";
-          checkbox.addEventListener("change", updateSelection);
-          const title = document.createElement("span");
-          title.textContent = item.title || "未命名对话";
-          title.title = title.textContent;
-          row.append(checkbox, title);
-          section.appendChild(row);
-        }
+        for (const item of group.items) appendRow(section, item);
         if (group.error) {
           const error = document.createElement("div");
           error.className = "codex-batch-error";
